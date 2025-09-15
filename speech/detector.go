@@ -8,6 +8,7 @@ import "C"
 import (
 	"fmt"
 	"log/slog"
+	"time"
 	"unsafe"
 )
 
@@ -56,6 +57,10 @@ type DetectorConfig struct {
 	SpeechPadMs int
 	// The loglevel for the onnx environment, by default it is set to LogLevelWarn.
 	LogLevel LogLevel
+	// ProgressCallback is an optional function called periodically with the detection progress (0.0 to 1.0).
+	ProgressCallback func(float64)
+	// ProgressInterval throttles ProgressCallback invocations. Default is 100ms if zero.
+	ProgressInterval time.Duration
 }
 
 func (c DetectorConfig) IsValid() error {
@@ -98,6 +103,10 @@ type Detector struct {
 	currSample int
 	triggered  bool
 	tempEnd    int
+
+	// progress callback throttling
+	lastProgress     time.Time
+	progressInterval time.Duration
 }
 
 func NewDetector(cfg DetectorConfig) (*Detector, error) {
@@ -165,6 +174,13 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 	sd.cStrings["stateN"] = C.CString("stateN")
 	sd.cStrings["output"] = C.CString("output")
 
+	// set default progress interval if not provided
+	if cfg.ProgressInterval <= 0 {
+		sd.progressInterval = 200 * time.Millisecond
+	} else {
+		sd.progressInterval = cfg.ProgressInterval
+	}
+
 	return &sd, nil
 }
 
@@ -194,6 +210,11 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 
 	minSilenceSamples := sd.cfg.MinSilenceDurationMs * sd.cfg.SampleRate / 1000
 	speechPadSamples := sd.cfg.SpeechPadMs * sd.cfg.SampleRate / 1000
+
+	if sd.cfg.ProgressCallback != nil {
+		sd.cfg.ProgressCallback(0)
+		sd.lastProgress = time.Now()
+	}
 
 	var segments []Segment
 	for i := 0; i < len(pcm)-windowSize; i += windowSize {
@@ -244,8 +265,17 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 
 			segments[len(segments)-1].SpeechEndAt = speechEndAt
 		}
-	}
 
+		// throttled progress callback
+		if sd.cfg.ProgressCallback != nil && time.Since(sd.lastProgress) >= sd.progressInterval {
+			progress := float64(sd.currSample) / float64(len(pcm))
+			sd.cfg.ProgressCallback(progress)
+			sd.lastProgress = time.Now()
+		}
+	}
+	if sd.cfg.ProgressCallback != nil {
+		sd.cfg.ProgressCallback(1.0)
+	}
 	slog.Debug("speech detection done", slog.Int("segmentsLen", len(segments)))
 
 	return segments, nil
@@ -259,6 +289,7 @@ func (sd *Detector) Reset() error {
 	sd.currSample = 0
 	sd.triggered = false
 	sd.tempEnd = 0
+	sd.lastProgress = time.Time{}
 	for i := 0; i < stateLen; i++ {
 		sd.state[i] = 0
 	}
